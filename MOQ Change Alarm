@@ -1,0 +1,99 @@
+/* 
+Add ISM (purchaser_code) at vendor level for easy parsing
+Ownership rule: most recent PO activity in last 90 days per vendor
+*/
+
+WITH ism_vendor_map AS (
+    SELECT
+        ven.vendor_number        AS vendor_id,
+        proc.purchaser_code      AS purchaser_code,
+        ROW_NUMBER() OVER (
+            PARTITION BY ven.vendor_number
+            ORDER BY proc.document_order_dttm DESC
+        ) AS rn
+    FROM chewybi.procurement_document_product_measures proc
+    JOIN chewybi.vendors ven
+        ON ven.vendor_key = proc.vendor_key
+    WHERE proc.document_order_dttm::DATE >= CURRENT_DATE() - 90
+),
+
+ism AS (
+    SELECT
+        vendor_id,
+        purchaser_code
+    FROM ism_vendor_map
+    WHERE rn = 1
+),
+
+daily_latest AS (
+    SELECT
+        ilv.item_id,
+        ilv.vendor_id,
+        ilv.moq,
+        ilv.job_start_time::DATE AS snapshot_date,
+        ilv.job_start_time,
+        ROW_NUMBER() OVER (
+            PARTITION BY ilv.item_id, ilv.vendor_id, ilv.job_start_time::DATE
+            ORDER BY ilv.job_start_time DESC
+        ) AS rn
+    FROM sc_replenishment_sandbox.socrates_item_location_vendor_attributes ilv
+    WHERE ilv.job_start_time::DATE IN (CURRENT_DATE() - 1, CURRENT_DATE() - 2)
+),
+
+snapshots AS (
+    SELECT
+        item_id,
+        vendor_id,
+        moq,
+        snapshot_date
+    FROM daily_latest
+    WHERE rn = 1
+),
+
+yesterday AS (
+    SELECT
+        item_id,
+        vendor_id,
+        moq
+    FROM snapshots
+    WHERE snapshot_date = CURRENT_DATE() - 1
+),
+
+prior_day AS (
+    SELECT
+        item_id,
+        vendor_id,
+        moq
+    FROM snapshots
+    WHERE snapshot_date = CURRENT_DATE() - 2
+)
+
+SELECT
+    COALESCE(y.item_id, p.item_id)             AS item_id,
+    COALESCE(y.vendor_id, p.vendor_id)         AS vendor_id,
+    COALESCE(i.purchaser_code, '') || '@chewy.com'
+                                                AS ism_purchaser_email,
+    p.moq                                      AS prior_moq,
+    y.moq                                      AS new_moq,
+    (CURRENT_DATE() - 2)                       AS prior_snapshot_date,
+    (CURRENT_DATE() - 1)                       AS new_snapshot_date,
+    CASE
+        WHEN p.item_id IS NULL THEN 'NEW_ITEM_VENDOR'
+        WHEN y.item_id IS NULL THEN 'MISSING_TODAY'
+        WHEN p.moq IS DISTINCT FROM y.moq THEN 'MOQ_CHANGED'
+        ELSE 'NO_CHANGE'
+    END                                        AS change_type
+FROM yesterday y
+FULL OUTER JOIN prior_day p
+    ON y.item_id = p.item_id
+   AND y.vendor_id = p.vendor_id
+LEFT JOIN ism i
+    ON i.vendor_id = COALESCE(y.vendor_id, p.vendor_id)
+WHERE
+       p.item_id IS NULL
+    OR y.item_id IS NULL
+    OR p.moq IS DISTINCT FROM y.moq
+ORDER BY
+    ism_purchaser_email,
+    vendor_id,
+    item_id;

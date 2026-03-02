@@ -1628,12 +1628,9 @@ def create_master_dataset(vendor_df: pd.DataFrame, period_mapping: Dict[str, Any
         else:
             chewy_forecasts_df = get_chewy_forecasts_aggregated(unique_skus, period_mapping)
         
-        # Step 4: Get actuals data (skip for Historical Upload mode)
-        if upload_mode == "Historical Upload":
-            # Create empty actuals DataFrame with correct structure
-            actuals_df = pd.DataFrame(columns=['chewy_sku', 'period_start_date', 'period_end_date', 'yoy_actual_units'])
-        else:
-            actuals_df = get_actuals_data_aggregated(unique_skus, period_mapping)
+        # Step 4: Get actuals data (now fetched for ALL modes including Historical Upload)
+        # This ensures YoY data is saved to snapshots for future viewing
+        actuals_df = get_actuals_data_aggregated(unique_skus, period_mapping)
         
         # Step 5: Merge all data sources
         
@@ -1743,7 +1740,7 @@ def check_existing_snapshot(vendor_number: str, period_start: date, period_end: 
         SELECT DISTINCT user_id, upload_timestamp, snapshot_id, 
                MIN(forecast_period_start) as min_period_start,
                MAX(forecast_period_end) as max_period_end
-        FROM forecast_reconciliation_snapshots 
+        FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS 
         WHERE vendor_number = '{vendor_number}'
         GROUP BY user_id, upload_timestamp, snapshot_id
         HAVING MIN(forecast_period_start) = '{period_start}' 
@@ -1844,7 +1841,7 @@ def save_forecast_snapshot(master_df: pd.DataFrame, user_notes: str, user_id: st
         if overwrite:
             try:
                 delete_query = f"""
-                DELETE FROM forecast_reconciliation_snapshots 
+                DELETE FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS 
                 WHERE vendor_number = '{vendor_number}'
                 AND forecast_period_start = '{period_start}'
                 AND forecast_period_end = '{period_end}'
@@ -2051,11 +2048,14 @@ def save_forecast_snapshot(master_df: pd.DataFrame, user_notes: str, user_id: st
         error_msg = f"Failed to save forecast snapshot: {str(e)}"
         raise ValueError(error_msg)
 
-def get_historical_snapshots() -> List[Dict]:
+def get_historical_snapshots(vendor_number: str = None) -> List[Dict]:
     """
     Get list of historical forecast snapshots available for accuracy analysis.
     Uses "Latest Wins" approach - for each vendor/period combination, only returns 
     the most recent upload, with attribution showing who submitted it.
+    
+    Args:
+        vendor_number: Optional vendor number to filter results
     
     Returns:
         List of dictionaries with snapshot metadata (deduplicated by latest upload)
@@ -2063,8 +2063,11 @@ def get_historical_snapshots() -> List[Dict]:
     try:
         session = snowflake_get_active_session()
         
+        # Build vendor filter
+        vendor_filter = f"AND vendor_number = '{vendor_number}'" if vendor_number else ""
+        
         # Get latest snapshot for each vendor/period combination using "Latest Wins"
-        query = """
+        query = f"""
         WITH latest_forecasts AS (
             SELECT 
                 snapshot_id,
@@ -2079,7 +2082,9 @@ def get_historical_snapshots() -> List[Dict]:
                     PARTITION BY vendor_number, forecast_period_start, forecast_period_end 
                     ORDER BY upload_timestamp DESC
                 ) as rn
-            FROM forecast_reconciliation_snapshots
+            FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS
+            WHERE 1=1
+            {vendor_filter}
         )
         SELECT 
             snapshot_id,
@@ -2178,6 +2183,116 @@ def get_forecast_evolution_data(vendor_number: str) -> pd.DataFrame:
         
     except Exception as e:
         st.error(f"Error loading forecast evolution data: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+        return pd.DataFrame()
+
+
+def load_most_recent_forecast(vendor_number: str) -> pd.DataFrame:
+    """
+    Load the most recent forecast snapshot for a vendor to enable Forward-Looking Analysis
+    in "View Historical" mode without requiring a CSV upload.
+    
+    IMPORTANT: This function now filters by BOTH snapshot_id AND vendor_number to handle
+    multi-vendor CSV uploads correctly - ensuring only SKUs for the requested vendor are returned.
+    
+    Args:
+        vendor_number: Vendor to load forecast for
+        
+    Returns:
+        DataFrame structured like master_dataset with most recent forecast data
+    """
+    try:
+        session = snowflake_get_active_session()
+        
+        # Get the most recent snapshot for this vendor
+        # FIXED: Now joins on BOTH snapshot_id AND vendor_number to prevent pulling 
+        # SKUs from other vendors when a multi-vendor CSV was uploaded
+        query = f"""
+        WITH latest_snapshot AS (
+            SELECT 
+                snapshot_id,
+                snapshot_date,
+                upload_timestamp,
+                upload_mode,
+                historical_snapshot_date
+            FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS
+            WHERE vendor_number = '{vendor_number}'
+            ORDER BY upload_timestamp DESC
+            LIMIT 1
+        )
+        SELECT 
+            f.vendor_number,
+            f.chewy_sku,
+            f.vendor_sku,
+            f.product_name,
+            f.brand_name,
+            f.mc1_category,
+            f.mc2_category,
+            f.forecast_period_start,
+            f.forecast_period_end,
+            f.period_name,
+            f.vendor_forecast_units,
+            f.chewy_forecast_units,
+            f.yoy_actual_units,
+            f.snapshot_date,
+            f.upload_timestamp,
+            f.upload_mode,
+            f.historical_snapshot_date
+        FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS f
+        INNER JOIN latest_snapshot ls 
+            ON f.snapshot_id = ls.snapshot_id
+            AND f.vendor_number = '{vendor_number}'  -- CRITICAL: Filter by vendor to prevent cross-vendor pollution
+        ORDER BY f.forecast_period_start, f.chewy_sku
+        """
+        
+        result = session.sql(query).to_pandas()
+        
+        if result.empty:
+            return pd.DataFrame()
+        
+        # Normalize column names to match master_dataset structure
+        # Snowflake returns uppercase column names, but master_dataset uses lowercase/mixed case
+        column_mapping = {
+            'VENDOR_NUMBER': 'vendor_number',
+            'CHEWY_SKU': 'chewy_sku',
+            'VENDOR_SKU': 'vendor_sku',
+            'PRODUCT_NAME': 'PRODUCT_NAME',  # Keep uppercase for display columns
+            'BRAND_NAME': 'BRAND_NAME',
+            'MC1_CATEGORY': 'MC1_CATEGORY',
+            'MC2_CATEGORY': 'MC2_CATEGORY',
+            'FORECAST_PERIOD_START': 'period_start_date',
+            'FORECAST_PERIOD_END': 'period_end_date',
+            'PERIOD_NAME': 'period_name',
+            'VENDOR_FORECAST_UNITS': 'vendor_forecast_units',
+            'CHEWY_FORECAST_UNITS': 'chewy_forecast_units',
+            'YOY_ACTUAL_UNITS': 'yoy_actual_units',
+            'SNAPSHOT_DATE': 'SNAPSHOT_DATE',
+            'UPLOAD_TIMESTAMP': 'UPLOAD_TIMESTAMP',
+            'UPLOAD_MODE': 'UPLOAD_MODE',
+            'HISTORICAL_SNAPSHOT_DATE': 'HISTORICAL_SNAPSHOT_DATE'
+        }
+        
+        result = result.rename(columns=column_mapping)
+        
+        # Store snapshot metadata in session state for display
+        st.session_state['loaded_snapshot_date'] = result['SNAPSHOT_DATE'].iloc[0]
+        st.session_state['loaded_upload_timestamp'] = result['UPLOAD_TIMESTAMP'].iloc[0]
+        
+        # Debug: Check YoY data loaded from snapshot
+        total_yoy = result['yoy_actual_units'].sum()
+        st.info(f"📊 Loaded forecast snapshot with {len(result):,} records and {total_yoy:,.0f} total YoY units")
+        
+        # Note: If YoY is 0, this snapshot was saved before YoY data collection was enabled.
+        # Re-upload the historical forecast to capture YoY data for future viewing.
+        if total_yoy == 0:
+            st.warning("⚠️ **Note:** This snapshot has no YoY data (saved before YoY collection was enabled). "
+                      "To view YoY analysis, re-upload this historical forecast - YoY data will be captured and saved.")
+        
+        return result
+        
+    except Exception as e:
+        st.error(f"Error loading most recent forecast: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
         return pd.DataFrame()
@@ -3873,7 +3988,7 @@ def generate_cover_sheet_query(vendor_numbers, start_date, end_date, include_dro
             0 as cut_priority,
             date_trunc('week', bo.order_placed_date) as week,
             SUM(bo.backorder_units)/SUM(bo.autoship_units) as backorder
-        FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+        FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
         JOIN EDLDB.CHEWYBI.products pp ON pp.product_part_number = bo.product_part_number
         JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
         WHERE 1=1
@@ -3893,7 +4008,7 @@ def generate_cover_sheet_query(vendor_numbers, start_date, end_date, include_dro
             1 as cut_priority,
             date_trunc('week', bo.order_placed_date) as week,
             SUM(bo.backorder_units)/SUM(bo.autoship_units) as backorder
-        FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+        FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
         JOIN EDLDB.CHEWYBI.products pp ON pp.product_part_number = bo.product_part_number
         JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
         WHERE 1=1
@@ -3912,7 +4027,7 @@ def generate_cover_sheet_query(vendor_numbers, start_date, end_date, include_dro
             2 as cut_priority,
             date_trunc('week', bo.order_placed_date) as week,
             SUM(bo.backorder_units)/SUM(bo.autoship_units) as backorder
-        FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+        FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
         JOIN EDLDB.CHEWYBI.products pp ON pp.product_part_number = bo.product_part_number
         JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
         WHERE 1=1
@@ -3933,7 +4048,7 @@ def generate_cover_sheet_query(vendor_numbers, start_date, end_date, include_dro
             4 as cut_priority,
             date_trunc('week', bo.order_placed_date) as week,
             SUM(bo.backorder_units)/SUM(bo.autoship_units) as backorder
-        FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+        FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
         JOIN EDLDB.CHEWYBI.products pp ON pp.product_part_number = bo.product_part_number
         JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
                 JOIN top ON pp.product_manufacturer_name = top.product_manufacturer_name
@@ -3953,7 +4068,7 @@ def generate_cover_sheet_query(vendor_numbers, start_date, end_date, include_dro
             5 as cut_priority,
             date_trunc('week', bo.order_placed_date) as week,
             SUM(bo.backorder_units)/SUM(bo.autoship_units) as backorder
-        FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+        FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
         JOIN EDLDB.CHEWYBI.products pp ON pp.product_part_number = bo.product_part_number
         JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
         WHERE 1=1
@@ -7053,8 +7168,14 @@ def create_demand_trend_charts():
                 weekly_data = chart_df[chart_df['Type'] == 'Weekly']
                 aggregate_data = chart_df[chart_df['Type'] == 'Aggregate'] if 'Type' in chart_df.columns else pd.DataFrame()
                 
-                # Sort dates reverse chronologically (newest on left, oldest on right)
-                date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                # Convert date strings to datetime for proper sorting
+                try:
+                    weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                    # Sort dates chronologically and convert back to string for display
+                    date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                except:
+                    # Fallback to string sorting if date conversion fails
+                    date_order = sorted(list(weekly_data['Date'].unique()))
                 
                 # Create base chart for weekly data only
                 base_chart = alt.Chart(weekly_data)
@@ -7381,8 +7502,14 @@ def create_top_demand_items_trend_chart(demand_data, wape_lt_cols, column_mappin
     
     chart_df = pd.DataFrame(chart_data)
     
-    # Sort dates to ensure newest on left (reverse chronological order)
-    date_order = sorted(list(chart_df['Date'].unique()), reverse=True)
+    # Convert date strings to datetime for proper sorting
+    try:
+        chart_df['Date_Sort'] = pd.to_datetime(chart_df['Date'], format='%m/%d/%Y', errors='coerce')
+        # Sort dates chronologically and convert back to string for display
+        date_order = chart_df.sort_values('Date_Sort')['Date'].unique().tolist()
+    except:
+        # Fallback to string sorting if date conversion fails
+        date_order = sorted(list(chart_df['Date'].unique()))
     
     # Create line chart with interactive selection
     click_selection = alt.selection_multi(fields=['Entity'])
@@ -8111,8 +8238,14 @@ def create_oos_trend_charts(oos_data):
                 weekly_data = chart_df[chart_df['Type'] == 'Weekly']
                 aggregate_data = chart_df[chart_df['Type'] == 'Aggregate'] if 'Type' in chart_df.columns else pd.DataFrame()
                 
-                # Sort dates reverse chronologically (newest on left, oldest on right)
-                date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                # Convert date strings to datetime for proper sorting
+                try:
+                    weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                    # Sort dates chronologically and convert back to string for display
+                    date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                except:
+                    # Fallback to string sorting if date conversion fails
+                    date_order = sorted(list(weekly_data['Date'].unique()))
                 
                 # Create base chart for weekly data only
                 base_chart = alt.Chart(weekly_data)
@@ -8230,8 +8363,14 @@ def create_top_items_trend_chart(oos_data, pdp_oos_cols, column_mapping):
             
             import altair as alt
             
-            # Sort dates to ensure newest on left (reverse chronological order)
-            date_order = sorted(list(chart_df['Date'].unique()), reverse=True)
+            # Convert date strings to datetime for proper sorting
+            try:
+                chart_df['Date_Sort'] = pd.to_datetime(chart_df['Date'], format='%m/%d/%Y', errors='coerce')
+                # Sort dates chronologically and convert back to string for display
+                date_order = chart_df.sort_values('Date_Sort')['Date'].unique().tolist()
+            except:
+                # Fallback to string sorting if date conversion fails
+                date_order = sorted(list(chart_df['Date'].unique()))
             
             # Create interactive selection
             click_selection = alt.selection_multi(fields=['Item'])
@@ -8517,8 +8656,14 @@ def create_asbo_trend_charts(asbo_data):
                 weekly_data = chart_df[chart_df['Type'] == 'Weekly']
                 aggregate_data = chart_df[chart_df['Type'] == 'Aggregate'] if 'Type' in chart_df.columns else pd.DataFrame()
                 
-                # Sort dates reverse chronologically (newest on left, oldest on right)
-                date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                # Convert date strings to datetime for proper sorting
+                try:
+                    weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                    # Sort dates chronologically and convert back to string for display
+                    date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                except:
+                    # Fallback to string sorting if date conversion fails
+                    date_order = sorted(list(weekly_data['Date'].unique()))
                 
                 # Create base chart for weekly data only
                 base_chart = alt.Chart(weekly_data)
@@ -8650,6 +8795,15 @@ def create_top_asbo_items_trend_chart(asbo_data, bo_rate_cols, column_mapping):
                 top_10_items = item_contributions.nlargest(10).index.tolist()
                 chart_df = chart_df[chart_df['Item'].isin(top_10_items)]
             
+            # Convert date strings to datetime for proper sorting
+            try:
+                chart_df['Date_Sort'] = pd.to_datetime(chart_df['Date'], format='%m/%d/%Y', errors='coerce')
+                # Sort dates chronologically and convert back to string for display
+                date_order = chart_df.sort_values('Date_Sort')['Date'].unique().tolist()
+            except:
+                # Fallback to string sorting if date conversion fails
+                date_order = sorted(list(chart_df['Date'].unique()))
+            
             import altair as alt
             
             # Create interactive selection
@@ -8664,7 +8818,7 @@ def create_top_asbo_items_trend_chart(asbo_data, bo_rate_cols, column_mapping):
                 strokeWidth=2,
                 interpolate='linear'
             ).encode(
-                x=alt.X('Date:N', title='Week Starting', sort=None),
+                x=alt.X('Date:N', title='Week Starting', sort=date_order),
                 y=alt.Y('BO Rate:Q', title='BO Rate', 
                        axis=alt.Axis(format='.2%', tickCount=10), 
                        scale=alt.Scale(zero=False, nice=True)),
@@ -9188,7 +9342,7 @@ def generate_asbo_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 pp.product_manufacturer_name,
                 {weekly_columns['combined_columns']},
                 {weekly_columns['aggregate_bo']}
-            FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+            FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
             JOIN EDLDB.chewybi.products pp ON pp.product_part_number = bo.product_part_number
             JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
             WHERE 1=1
@@ -9227,7 +9381,7 @@ def generate_asbo_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 pp.product_name as product_name,
                 {weekly_columns['combined_columns']},
                 {weekly_columns['aggregate_bo']}
-            FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+            FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
             JOIN EDLDB.chewybi.products pp ON pp.product_part_number = bo.product_part_number
             JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
             WHERE 1=1
@@ -9267,7 +9421,7 @@ def generate_asbo_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 pp.product_merch_classification1,
                 {weekly_columns['combined_columns']},
                 {weekly_columns['aggregate_bo']}
-            FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+            FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
             JOIN EDLDB.chewybi.products pp ON pp.product_part_number = bo.product_part_number
             JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
             WHERE 1=1
@@ -9304,7 +9458,7 @@ def generate_asbo_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 pp.product_merch_classification2,
                 {weekly_columns['combined_columns']},
                 {weekly_columns['aggregate_bo']}
-            FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+            FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
             JOIN EDLDB.chewybi.products pp ON pp.product_part_number = bo.product_part_number
             JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
             WHERE 1=1
@@ -9345,7 +9499,7 @@ def generate_asbo_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']},
                 {weekly_columns['aggregate_bo']},
                 0 as rn
-            FROM SC_AUTOSHIP_SANDBOX.AS_SC_autoship_backorders bo
+            FROM EDLDB.SC_REPLENISHMENT_SANDBOX.SCRA__CUR_AUTOSHIP_BACKORDERS_BASE bo
             JOIN EDLDB.chewybi.products pp ON pp.product_part_number = bo.product_part_number
             JOIN vendor_skus vs ON pp.product_part_number = vs.product_part_number
             WHERE 1=1
@@ -9859,9 +10013,19 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
     # Get vendor list for filtering
     vendor_list = "', '".join(vendor_numbers)
     
+    # Product-level filters to match CPFR metrics methodology
+    product_filters = """
+        AND p.product_merch_classification2 <> 'Pharmacy'
+        AND p.product_merch_classification1 NOT IN ('Virtual Bundle','Gift Cards')
+        AND p.product_is_compound = false
+        AND p.product_published_flag = true
+        AND (p.attribute_onetimebuy_flag = FALSE OR p.attribute_onetimebuy_flag IS NULL)
+        AND p.product_company_description <> 'Chewy Canada'
+    """
+    
     dropship_filter = ""
     if not include_dropship:
-        dropship_filter = "AND wt.BRAND NOT LIKE '%DROPSHIP%'"  # Adjust filter for WISP_total table
+        dropship_filter = "AND p.product_dropship_flag = false"
     
     query = f"""
         WITH vendor_skus AS (
@@ -9892,7 +10056,7 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                     ROW_NUMBER() OVER (PARTITION BY pls.product_part_number ORDER BY pls.snapshot_date DESC) as rn
                 FROM vendor_skus vs 
                 JOIN EDLDB.CHEWYBI.product_lifecycle_snapshot pls ON pls.product_part_number = vs.product_part_number
-                JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt 
+                JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt 
                     ON vs.product_part_number = wt.PRODUCT_PART_NUMBER 
                     AND pls.snapshot_date = wt.THE_DATE
                 WHERE wt.WEEK_START >= '{start_date_actual}'::date
@@ -9905,11 +10069,13 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 SUM(wt.TOTAL_PERFECT_SALES - wt.TOTAL_UNITS) as total_lost_units_amount
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.CHEWYBI.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
         ),
         
@@ -9926,12 +10092,14 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']}
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.CHEWYBI.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             CROSS JOIN total_lost_units tlu
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
             GROUP BY vs.vendor_name, tlu.total_lost_units_amount
         ),
@@ -9949,12 +10117,14 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']}
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.CHEWYBI.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             CROSS JOIN total_lost_units tlu
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
             GROUP BY wt.MC1, tlu.total_lost_units_amount
         ),
@@ -9972,12 +10142,14 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']}
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.CHEWYBI.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             CROSS JOIN total_lost_units tlu
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
             GROUP BY wt.MC2, tlu.total_lost_units_amount
         ),
@@ -9995,12 +10167,14 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']}
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.CHEWYBI.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             CROSS JOIN total_lost_units tlu
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
             GROUP BY wt.BRAND, tlu.total_lost_units_amount
             ORDER BY SUM(wt.TOTAL_PERFECT_SALES - wt.TOTAL_UNITS) DESC
@@ -10020,13 +10194,14 @@ def generate_wisp_query(vendor_numbers, start_date, end_date, aggregation, inclu
                 {weekly_columns['combined_columns']}
             FROM vendor_skus vs
             JOIN sku_pricing sp ON sp.product_part_number = vs.product_part_number
-            JOIN EDLDB.SC_REPLENISHMENT_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
-            JOIN EDLDB.chewybi.products p ON p.product_part_number = vs.product_part_number
+            JOIN EDLDB.SC_SANDBOX.WISP_TOTAL wt ON vs.product_part_number = wt.PRODUCT_PART_NUMBER
+            JOIN EDLDB.chewybi.products p ON wt.PRODUCT_PART_NUMBER = p.product_part_number
             CROSS JOIN total_lost_units tlu
             WHERE 1=1
-                AND wt.MC2 <> 'Pharmacy'
+                AND wt.PRODUCT_PART_NUMBER < '1000000000'
                 AND wt.WEEK_START >= '{start_date_actual}'::date
                 AND wt.WEEK_START <= '{end_date_actual}'::date
+                {product_filters}
                 {dropship_filter}
             GROUP BY vs.product_part_number, p.product_name, tlu.total_lost_units_amount
             HAVING SUM(wt.TOTAL_PERFECT_SALES - wt.TOTAL_UNITS) / NULLIFZERO(tlu.total_lost_units_amount) > 0
@@ -10122,29 +10297,33 @@ def generate_weekly_fillrate_columns(start_date, end_date, weeks_back):
     # Add aggregate columns (trailing weeks totals) - NEW NAMING AND ADDITIONAL METRICS
     trailing_weeks_suffix = f"T{weeks_back}W"
     
-    # Aggregate fill rate for entire timeframe (renamed from overall_fill_rate)
+    # Build date filter for aggregate columns to match displayed weeks only
+    week_date_list = ', '.join([f"'{week_start.strftime('%Y-%m-%d')}'::date" for week_start in week_dates])
+    
+    # Aggregate fill rate for displayed weeks only (not all data in base_fillrate)
     aggregate_fill_rate = f"""
         CASE 
-            WHEN SUM(original_order_qty) > 0 
-            THEN SUM(capped_received_qty) / SUM(original_order_qty)
+            WHEN SUM(CASE WHEN week_date IN ({week_date_list}) THEN original_order_qty ELSE 0 END) > 0 
+            THEN SUM(CASE WHEN week_date IN ({week_date_list}) THEN capped_received_qty ELSE 0 END) / 
+                 SUM(CASE WHEN week_date IN ({week_date_list}) THEN original_order_qty ELSE 0 END)
             ELSE NULL  -- No orders = no fill rate data (not 100%)
         END as FILL_RATE_{trailing_weeks_suffix}"""
     
-    # NEW: Aggregate order quantity for entire timeframe
+    # Aggregate order quantity for displayed weeks only
     aggregate_order_qty = f"""
-        SUM(original_order_qty) as ORDER_QTY_{trailing_weeks_suffix}"""
+        SUM(CASE WHEN week_date IN ({week_date_list}) THEN original_order_qty ELSE 0 END) as ORDER_QTY_{trailing_weeks_suffix}"""
     
-    # NEW: Aggregate received quantity for entire timeframe
+    # Aggregate received quantity for displayed weeks only
     aggregate_received_qty = f"""
-        SUM(capped_received_qty) as RECEIVED_QTY_{trailing_weeks_suffix}"""
+        SUM(CASE WHEN week_date IN ({week_date_list}) THEN capped_received_qty ELSE 0 END) as RECEIVED_QTY_{trailing_weeks_suffix}"""
     
-    # NEW: Aggregate accepted units for entire timeframe
+    # Aggregate accepted units for displayed weeks only
     aggregate_accepted_units = f"""
-        SUM(units_accepted) as ACCEPTED_UNITS_{trailing_weeks_suffix}"""
+        SUM(CASE WHEN week_date IN ({week_date_list}) THEN units_accepted ELSE 0 END) as ACCEPTED_UNITS_{trailing_weeks_suffix}"""
     
-    # Aggregate unfilled units for entire timeframe
+    # Aggregate unfilled units for displayed weeks only
     aggregate_unfilled = f"""
-        SUM(unfilled_units) as UNFILLED_UNITS_{trailing_weeks_suffix}"""
+        SUM(CASE WHEN week_date IN ({week_date_list}) THEN unfilled_units ELSE 0 END) as UNFILLED_UNITS_{trailing_weeks_suffix}"""
     
     # Add aggregates to all levels in logical order
     aggregate_columns = [aggregate_fill_rate, aggregate_order_qty, aggregate_received_qty, aggregate_accepted_units, aggregate_unfilled]
@@ -10186,7 +10365,8 @@ def generate_weekly_fillrate_columns(start_date, end_date, weeks_back):
         'final_column_refs': final_column_refs,
         'column_mapping': column_mapping,
         'weeks_back': weeks_back,
-        'trailing_weeks_suffix': trailing_weeks_suffix
+        'trailing_weeks_suffix': trailing_weeks_suffix,
+        'week_date_filter': week_date_list  # Add week date filter for base CTEs
     }
 
 
@@ -10214,6 +10394,9 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
     
     # Generate weekly column references
     weekly_columns = generate_weekly_fillrate_columns(start_date, end_date, weeks_back)
+    
+    # Extract week date filter for use in query
+    week_date_filter = weekly_columns['week_date_filter']
     
     # Dropship filter
     dropship_filter = ""
@@ -10295,13 +10478,14 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
             SELECT 
                 vendor_name,
                 {weekly_columns['vendor_columns']},
-                -- Aggregate metrics
-                SUM(unfilled_units) as total_unfilled_units,
-                SUM(original_order_qty) as total_original_qty,
-                SUM(capped_received_qty) as total_capped_received,
+                -- Aggregate metrics (filtered to displayed weeks only)
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN unfilled_units ELSE 0 END) as total_unfilled_units,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) as total_original_qty,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) as total_capped_received,
                 CASE 
-                    WHEN SUM(original_order_qty) > 0 
-                    THEN SUM(capped_received_qty) / SUM(original_order_qty)
+                    WHEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) > 0 
+                    THEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) / 
+                         SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END)
                     ELSE NULL  -- No orders = no fill rate data (not 100%)
                 END as overall_fill_rate
             FROM base_fillrate
@@ -10326,12 +10510,13 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
             SELECT 
                 product_merch_classification1,
                 {weekly_columns['mc1_columns']},
-                SUM(unfilled_units) as total_unfilled_units,
-                SUM(original_order_qty) as total_original_qty,
-                SUM(capped_received_qty) as total_capped_received,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN unfilled_units ELSE 0 END) as total_unfilled_units,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) as total_original_qty,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) as total_capped_received,
                 CASE 
-                    WHEN SUM(original_order_qty) > 0 
-                    THEN SUM(capped_received_qty) / SUM(original_order_qty)
+                    WHEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) > 0 
+                    THEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) / 
+                         SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END)
                     ELSE NULL  -- No orders = no fill rate data (not 100%)
                 END as overall_fill_rate
             FROM base_fillrate
@@ -10356,12 +10541,13 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
             SELECT 
                 product_merch_classification2,
                 {weekly_columns['mc2_columns']},
-                SUM(unfilled_units) as total_unfilled_units,
-                SUM(original_order_qty) as total_original_qty,
-                SUM(capped_received_qty) as total_capped_received,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN unfilled_units ELSE 0 END) as total_unfilled_units,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) as total_original_qty,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) as total_capped_received,
                 CASE 
-                    WHEN SUM(original_order_qty) > 0 
-                    THEN SUM(capped_received_qty) / SUM(original_order_qty)
+                    WHEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) > 0 
+                    THEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) / 
+                         SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END)
                     ELSE NULL  -- No orders = no fill rate data (not 100%)
                 END as overall_fill_rate
             FROM base_fillrate
@@ -10386,12 +10572,13 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
             SELECT 
                 product_manufacturer_name,
                 {weekly_columns['brand_columns']},
-                SUM(unfilled_units) as total_unfilled_units,
-                SUM(original_order_qty) as total_original_qty,
-                SUM(capped_received_qty) as total_capped_received,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN unfilled_units ELSE 0 END) as total_unfilled_units,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) as total_original_qty,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) as total_capped_received,
                 CASE 
-                    WHEN SUM(original_order_qty) > 0 
-                    THEN SUM(capped_received_qty) / SUM(original_order_qty)
+                    WHEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) > 0 
+                    THEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) / 
+                         SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END)
                     ELSE NULL  -- No orders = no fill rate data (not 100%)
                 END as overall_fill_rate
             FROM base_fillrate
@@ -10427,12 +10614,13 @@ def generate_fillrate_query(vendor_numbers, start_date, end_date, aggregation, i
                 product_part_number,
                 product_name,
                 {weekly_columns['sku_columns']},
-                SUM(unfilled_units) as total_unfilled_units,
-                SUM(original_order_qty) as total_original_qty,
-                SUM(capped_received_qty) as total_capped_received,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN unfilled_units ELSE 0 END) as total_unfilled_units,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) as total_original_qty,
+                SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) as total_capped_received,
                 CASE 
-                    WHEN SUM(original_order_qty) > 0 
-                    THEN SUM(capped_received_qty) / SUM(original_order_qty)
+                    WHEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END) > 0 
+                    THEN SUM(CASE WHEN week_date IN ({week_date_filter}) THEN capped_received_qty ELSE 0 END) / 
+                         SUM(CASE WHEN week_date IN ({week_date_filter}) THEN original_order_qty ELSE 0 END)
                     ELSE NULL  -- No orders = no fill rate data (not 100%)
                 END as overall_fill_rate
             FROM base_fillrate
@@ -11364,8 +11552,14 @@ def create_nop_trend_charts(nop_data):
                 weekly_data = chart_df[chart_df['Type'] == 'Weekly']
                 aggregate_data = chart_df[chart_df['Type'] == 'Aggregate'] if 'Type' in chart_df.columns else pd.DataFrame()
                 
-                # Sort dates reverse chronologically (newest on left, oldest on right)
-                date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                # Convert date strings to datetime for proper sorting
+                try:
+                    weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                    # Sort dates chronologically and convert back to string for display
+                    date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                except:
+                    # Fallback to string sorting if date conversion fails
+                    date_order = sorted(list(weekly_data['Date'].unique()))
                 
                 # Create base chart for weekly data only
                 base_chart = alt.Chart(weekly_data)
@@ -11497,6 +11691,15 @@ def create_top_nop_items_trend_chart(nop_data, nop_rate_cols, column_mapping):
                 top_10_items = item_contributions.nlargest(10).index.tolist()
                 chart_df = chart_df[chart_df['Item'].isin(top_10_items)]
             
+            # Convert date strings to datetime for proper sorting
+            try:
+                chart_df['Date_Sort'] = pd.to_datetime(chart_df['Date'], format='%m/%d/%Y', errors='coerce')
+                # Sort dates chronologically and convert back to string for display
+                date_order = chart_df.sort_values('Date_Sort')['Date'].unique().tolist()
+            except:
+                # Fallback to string sorting if date conversion fails
+                date_order = sorted(list(chart_df['Date'].unique()))
+            
             import altair as alt
             
             # Create interactive selection
@@ -11511,7 +11714,7 @@ def create_top_nop_items_trend_chart(nop_data, nop_rate_cols, column_mapping):
                 strokeWidth=2,
                 interpolate='linear'
             ).encode(
-                x=alt.X('Date:N', title='Week Starting', sort=None),
+                x=alt.X('Date:N', title='Week Starting', sort=date_order),
                 y=alt.Y('NOP Rate:Q', title='NOP Rate', 
                        axis=alt.Axis(format='.2%', tickCount=10), 
                        scale=alt.Scale(zero=False, nice=True)),
@@ -11988,8 +12191,14 @@ def create_wisp_trend_charts():
                 # Create line chart with interactive selection
                 import altair as alt
                 
-                # Sort dates reverse chronologically (newest on left, oldest on right)
-                date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                # Convert date strings to datetime for proper sorting
+                try:
+                    weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                    # Sort dates chronologically and convert back to string for display
+                    date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                except:
+                    # Fallback to string sorting if date conversion fails
+                    date_order = sorted(list(weekly_data['Date'].unique()))
                 
                 # Create base chart for weekly data only
                 base_chart = alt.Chart(weekly_data)
@@ -12095,8 +12304,14 @@ def create_top_wisp_items_trend_chart(wisp_data, wisp_cols, column_mapping):
     
     chart_df = pd.DataFrame(chart_data)
     
-    # Sort dates to ensure newest on left (reverse chronological order)
-    date_order = sorted(list(chart_df['Date'].unique()), reverse=True)
+    # Convert date strings to datetime for proper sorting
+    try:
+        chart_df['Date_Sort'] = pd.to_datetime(chart_df['Date'], format='%m/%d/%Y', errors='coerce')
+        # Sort dates chronologically and convert back to string for display
+        date_order = chart_df.sort_values('Date_Sort')['Date'].unique().tolist()
+    except:
+        # Fallback to string sorting if date conversion fails
+        date_order = sorted(list(chart_df['Date'].unique()))
     
     # Create line chart with interactive selection
     click_selection = alt.selection_multi(fields=['Entity'])
@@ -12720,9 +12935,15 @@ def create_fillrate_trend_charts(fillrate_data, column_mapping):
                 weekly_data = chart_df[chart_df['Type'] == 'Weekly']
                 aggregate_data = chart_df[chart_df['Type'] == 'Aggregate'] if aggregate_fill_col else pd.DataFrame()
                 
-                # Sort dates to ensure proper chronological order (newest on left)
+                # Convert date strings to datetime for proper sorting
                 if not weekly_data.empty:
-                    date_order = sorted(list(weekly_data['Date'].unique()), reverse=True)
+                    try:
+                        weekly_data['Date_Sort'] = pd.to_datetime(weekly_data['Date'], format='%m/%d/%Y', errors='coerce')
+                        # Sort dates chronologically and convert back to string for display
+                        date_order = weekly_data.sort_values('Date_Sort')['Date'].unique().tolist()
+                    except:
+                        # Fallback to string sorting if date conversion fails
+                        date_order = sorted(list(weekly_data['Date'].unique()))
                     
                     # Create weekly lines
                     weekly_lines = alt.Chart(weekly_data).mark_line(point=True, strokeWidth=2).encode(
@@ -14083,41 +14304,70 @@ def forecast_reconciliation_tool():
     
     # Conditional UI based on upload mode
     if upload_mode == "View Historical (No Upload)":
-        # Show vendor number input instead of file uploader
+        # Show vendor number input instead of file uploader - now supports multiple vendors
         vendor_number_input = st.text_input(
-            "Enter Vendor Number:",
-            placeholder="e.g., B10775",
-            help="Enter the vendor number to view historical forecast data",
+            "Enter Vendor Number(s):",
+            placeholder="e.g., B10775 or B10775, 3756, P000356",
+            help="Enter one or more vendor numbers separated by commas to view historical forecast data",
             key="historical_vendor_number"
         )
         
         if vendor_number_input and vendor_number_input.strip():
             # Create a button to load historical data
             if st.button("📊 Load Historical Data", type="primary", use_container_width=True):
-                with st.spinner("Loading historical data for vendor..."):
+                with st.spinner("Loading most recent forecast and historical data for vendor(s)..."):
                     try:
-                        # Set up minimal session state to simulate uploaded data
-                        vendor_num = vendor_number_input.strip()
+                        # Parse vendor numbers (support comma-separated list)
+                        vendor_nums_raw = [v.strip() for v in vendor_number_input.split(',') if v.strip()]
+                        
+                        # Deduplicate and normalize
+                        vendor_nums = list(set(vendor_nums_raw))
+                        
                         st.session_state['view_only_mode'] = True
-                        st.session_state['view_only_vendor'] = vendor_num
-                        st.session_state['master_dataset_ready'] = True
+                        st.session_state['view_only_vendors'] = vendor_nums  # Store as list
                         
-                        # Create a minimal master dataset with just vendor info
+                        # Load the most recent forecast snapshot for each vendor
                         import pandas as pd
-                        minimal_df = pd.DataFrame({
-                            'vendor_number': [vendor_num]
-                        })
-                        st.session_state['master_dataset'] = minimal_df
+                        all_forecasts = []
                         
-                        # Track successful historical data load
-                        track_tool_action(
-                            tool_name="Forecast Reconciliation",
-                            action_type="View Historical - Load Data",
-                            additional_metadata={"vendor_number": vendor_num}
-                        )
+                        for vendor_num in vendor_nums:
+                            most_recent_forecast = load_most_recent_forecast(vendor_num)
+                            if not most_recent_forecast.empty:
+                                all_forecasts.append(most_recent_forecast)
                         
-                        st.success(f"✅ Ready to view historical data for vendor {vendor_num}")
-                        st.info("👇 Scroll down to the **Forecast Analysis** section and select the **Historical Accuracy** tab")
+                        if all_forecasts:
+                            # Combine all vendor forecasts
+                            combined_forecast = pd.concat(all_forecasts, ignore_index=True)
+                            
+                            # Store as master dataset to enable Forward-Looking Analysis
+                            st.session_state['master_dataset'] = combined_forecast
+                            st.session_state['master_dataset_ready'] = True
+                            st.session_state['loaded_from_historical'] = True  # Flag to show appropriate message
+                            
+                            # Track successful historical data load
+                            track_tool_action(
+                                tool_name="Forecast Reconciliation",
+                                action_type="View Historical - Load Data",
+                                additional_metadata={"vendor_numbers": vendor_nums, "vendor_count": len(vendor_nums)}
+                            )
+                            
+                            st.success(f"✅ Successfully loaded most recent forecast for {len(vendor_nums)} vendor(s): {', '.join(vendor_nums)}")
+                            st.info("📊 **Displaying most recent uploaded forecast for analysis**")
+                            st.info("👇 Scroll down to the **Forecast Analysis** section to view Forward-Looking Analysis or Historical Accuracy")
+                        else:
+                            # No forecast found - still enable Historical Accuracy tab
+                            st.session_state['view_only_mode'] = True
+                            st.session_state['view_only_vendors'] = vendor_nums
+                            st.session_state['master_dataset_ready'] = True
+                            
+                            # Create a minimal master dataset with just vendor info
+                            minimal_df = pd.DataFrame({
+                                'vendor_number': vendor_nums
+                            })
+                            st.session_state['master_dataset'] = minimal_df
+                            
+                            st.warning(f"⚠️ No forecast snapshots found for vendor(s): {', '.join(vendor_nums)}")
+                            st.info("👇 You can still view **Historical Accuracy** if past periods have been uploaded")
                         
                     except Exception as e:
                         st.error(f"❌ Error loading historical data: {str(e)}")
@@ -14667,19 +14917,26 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
             st.markdown("### 🔮 Forward-Looking Variance Analysis")
             st.markdown("*Compare vendor forecasts vs Chewy forecasts for upcoming periods*")
             
-            # Check if we're in view-only mode
-            if st.session_state.get('view_only_mode', False):
+            # Check if we have forecast data to display
+            # Show warning only if we're in view-only mode AND don't have a loaded forecast
+            if st.session_state.get('view_only_mode', False) and not st.session_state.get('loaded_from_historical', False):
+                # View-only mode WITHOUT a loaded forecast (old behavior - should rarely happen now)
                 st.info("ℹ️ **View-Only Mode Active**")
                 st.warning("⚠️ Forward-Looking Analysis requires a vendor forecast upload. Please use the **Historical Accuracy** tab to view past performance, or switch to **Current Analysis** mode to upload a new forecast.")
             
-            # Only proceed with forward-looking analysis if NOT in view-only mode
-            if not st.session_state.get('view_only_mode', False):
+            # Show analysis if we have data (either from upload OR from loaded historical)
+            if not st.session_state.get('view_only_mode', False) or st.session_state.get('loaded_from_historical', False):
+                # Either NOT in view-only mode, OR in view-only mode WITH a loaded forecast
                 master_df = st.session_state['master_dataset']
+                
+                # Show info banner if loaded from historical
+                if st.session_state.get('loaded_from_historical', False):
+                    st.info("📊 **Displaying most recent uploaded forecast for analysis**")
             
                     # Show current upload coverage
-                period_start = master_df['period_start_date'].min().strftime('%b %Y')
-                period_end = master_df['period_end_date'].max().strftime('%b %Y')
-                num_periods = master_df['period_name'].nunique()
+                period_start = master_df['FORECAST_PERIOD_START'].min().strftime('%b %Y') if 'FORECAST_PERIOD_START' in master_df.columns else master_df['period_start_date'].min().strftime('%b %Y')
+                period_end = master_df['FORECAST_PERIOD_END'].max().strftime('%b %Y') if 'FORECAST_PERIOD_END' in master_df.columns else master_df['period_end_date'].max().strftime('%b %Y')
+                num_periods = master_df['PERIOD_NAME'].nunique() if 'PERIOD_NAME' in master_df.columns else master_df['period_name'].nunique()
                 
                 st.info(f"📅 **Current Upload Coverage:** {period_start} - {period_end} ({num_periods} periods)")
                 
@@ -14695,6 +14952,11 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                     with col1:
                         st.markdown("**📦 Product Filters**")
                         
+                        # Normalize column names for consistency
+                        chewy_sku_col = 'CHEWY_SKU' if 'CHEWY_SKU' in master_df.columns else 'chewy_sku'
+                        product_name_col = 'PRODUCT_NAME' if 'PRODUCT_NAME' in master_df.columns else 'product_name'
+                        brand_name_col = 'BRAND_NAME' if 'BRAND_NAME' in master_df.columns else 'brand_name'
+                        
                         # SKU Selection Mode
                         sku_mode = st.radio(
                             "SKU Selection:",
@@ -14708,9 +14970,9 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                             sku_options = []
                             sku_mapping = {}
                             
-                            for sku in sorted(master_df['chewy_sku'].unique()):
+                            for sku in sorted(master_df[chewy_sku_col].unique()):
                                 # Get product name for this SKU (take first non-null value)
-                                product_name = master_df[master_df['chewy_sku'] == sku]['PRODUCT_NAME'].dropna()
+                                product_name = master_df[master_df[chewy_sku_col] == sku][product_name_col].dropna()
                                 if not product_name.empty:
                                     display_name = f"{sku} - {product_name.iloc[0]}"
                                 else:
@@ -14735,11 +14997,11 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                             
                             
                         else:
-                            selected_skus = master_df['chewy_sku'].unique().tolist()
+                            selected_skus = master_df[chewy_sku_col].unique().tolist()
                         
                         # Brand Filter
-                        if 'BRAND_NAME' in master_df.columns:
-                            available_brands = sorted(master_df['BRAND_NAME'].unique())  # Include N/A values
+                        if brand_name_col in master_df.columns:
+                            available_brands = sorted(master_df[brand_name_col].unique())  # Include N/A values
                             selected_brands = st.multiselect(
                                 "Brands:",
                                 available_brands,
@@ -14805,8 +15067,11 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                     with col3:
                         st.markdown("**📅 Period & PC Filters**")
                         
+                        # Normalize period name column
+                        period_name_col = 'PERIOD_NAME' if 'PERIOD_NAME' in master_df.columns else 'period_name'
+                        
                         # Period Selection
-                        available_periods = sorted(master_df['period_name'].unique())
+                        available_periods = sorted(master_df[period_name_col].unique())
                         selected_periods = st.multiselect(
                             "Periods:",
                             available_periods,
@@ -14869,11 +15134,11 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                 
                 # Apply SKU filter
                 if selected_skus:
-                    filtered_df = filtered_df[filtered_df['chewy_sku'].isin(selected_skus)]
+                    filtered_df = filtered_df[filtered_df[chewy_sku_col].isin(selected_skus)]
                 
                 # Apply Brand filter (now that NULLs are replaced with "N/A", standard filtering works)
-                if selected_brands and 'BRAND_NAME' in master_df.columns:
-                    filtered_df = filtered_df[filtered_df['BRAND_NAME'].isin(selected_brands)]
+                if selected_brands and brand_name_col in master_df.columns:
+                    filtered_df = filtered_df[filtered_df[brand_name_col].isin(selected_brands)]
                 
                 # Apply MC1 filter
                 if selected_mc1 and 'MC1_CATEGORY' in master_df.columns:
@@ -14901,11 +15166,11 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                 
                 # Apply Period filter
                 if selected_periods:
-                    filtered_df = filtered_df[filtered_df['period_name'].isin(selected_periods)]
+                    filtered_df = filtered_df[filtered_df[period_name_col].isin(selected_periods)]
                 
                 # Show filter results
                 if not filtered_df.empty:
-                    st.info(f"📊 **Filtered Results:** {len(filtered_df)} records | {filtered_df['chewy_sku'].nunique()} SKUs | {filtered_df['period_name'].nunique()} periods")
+                    st.info(f"📊 **Filtered Results:** {len(filtered_df)} records | {filtered_df[chewy_sku_col].nunique()} SKUs | {filtered_df[period_name_col].nunique()} periods")
                     
                     # Debug: Show filtering impact on vendor forecast totals
                     if st.session_state.get('debug_mode', False):
@@ -15058,9 +15323,13 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                     # Check upload mode to determine which data to include
                     upload_mode = st.session_state.get('upload_mode', 'Current Analysis')
                     
+                    # Override: Always show YoY data when in "View Historical (No Upload)" mode
+                    # This ensures consistent display regardless of the original upload mode
+                    show_yoy_data = (upload_mode != "Historical Upload") or st.session_state.get('loaded_from_historical', False)
+                    
                     # Prepare data for Altair (need to melt for multiple lines)
-                    if upload_mode == "Historical Upload":
-                        # Exclude YoY Actuals for Historical Upload mode
+                    if not show_yoy_data:
+                        # Exclude YoY Actuals for Historical Upload mode (when actively uploading)
                         chart_data = trend_data.melt(
                             id_vars=['chart_label', 'period_start_date'],
                             value_vars=['vendor_forecast_units', 'chewy_forecast_units'],
@@ -15074,7 +15343,7 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                             'chewy_forecast_units': 'Chewy Forecast'
                         })
                     else:
-                        # Include all data for Current Analysis mode
+                        # Include all data for Current Analysis mode or View Historical mode
                         chart_data = trend_data.melt(
                             id_vars=['chart_label', 'period_start_date'],
                             value_vars=['vendor_forecast_units', 'chewy_forecast_units', 'yoy_actual_units'],
@@ -15089,8 +15358,8 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                             'yoy_actual_units': 'YoY Actuals'
                         })
                     
-                    # Set up color scale based on upload mode
-                    if upload_mode == "Historical Upload":
+                    # Set up color scale based on whether we're showing YoY data
+                    if not show_yoy_data:
                         color_domain = ['Vendor Forecast', 'Chewy Forecast']
                         color_range = ['#1f77b4', '#ff7f0e']
                     else:
@@ -15335,62 +15604,80 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
             
             # Check for historical data
             try:
-                historical_snapshots = get_historical_snapshots()
+                # Get current vendor for filtering (needed for functionality)
+                # Check for view-only mode first, then regular upload mode
+                # Now handles multiple vendors in view-only mode
+                current_vendors = []
+                if st.session_state.get('view_only_mode', False):
+                    # Check for both old single vendor and new multi-vendor keys
+                    if 'view_only_vendors' in st.session_state:
+                        current_vendors = st.session_state.get('view_only_vendors', [])
+                    elif 'view_only_vendor' in st.session_state:
+                        # Backward compatibility with old single vendor key
+                        single_vendor = st.session_state.get('view_only_vendor')
+                        current_vendors = [single_vendor] if single_vendor else []
+                elif st.session_state.get('master_dataset_ready', False):
+                    master_df = st.session_state['master_dataset']
+                    # Get unique vendors from master dataset
+                    current_vendors = master_df['vendor_number'].unique().tolist()
+                
+                # For historical accuracy, we'll process each vendor separately
+                # but display them together in the UI
+                if not current_vendors:
+                    st.warning("⚠️ No vendor(s) selected")
+                else:
+                    # Show vendor selection if multiple vendors
+                    if len(current_vendors) > 1:
+                        st.info(f"📊 **{len(current_vendors)} vendors loaded:** {', '.join(current_vendors)}")
+                        
+                        # Allow user to select which vendor(s) to analyze
+                        selected_vendors = st.multiselect(
+                            "Select vendor(s) for historical accuracy analysis:",
+                            options=current_vendors,
+                            default=current_vendors,
+                            help="Choose one or more vendors to include in the historical accuracy analysis"
+                        )
+                    else:
+                        selected_vendors = current_vendors
+                    
+                    if not selected_vendors:
+                        st.warning("⚠️ Please select at least one vendor to analyze")
+                        st.stop()
+                
+                # Get historical snapshots for selected vendors (combined)
+                all_historical_snapshots = []
+                for vendor in selected_vendors:
+                    vendor_snapshots = get_historical_snapshots(vendor)
+                    if vendor_snapshots:
+                        all_historical_snapshots.extend(vendor_snapshots)
                 
                 st.markdown("---")
                 
-                # Get current vendor for filtering (needed for functionality)
-                # Check for view-only mode first, then regular upload mode
-                current_vendor = None
-                if st.session_state.get('view_only_mode', False):
-                    current_vendor = st.session_state.get('view_only_vendor')
-                elif st.session_state.get('master_dataset_ready', False):
-                    master_df = st.session_state['master_dataset']
-                    current_vendor = master_df['vendor_number'].iloc[0]
-                
-                # Get current vendor for filtering (needed for functionality)
-                # Check for view-only mode first, then regular upload mode
-                current_vendor = None
-                if st.session_state.get('view_only_mode', False):
-                    current_vendor = st.session_state.get('view_only_vendor')
-                elif st.session_state.get('master_dataset_ready', False):
-                    master_df = st.session_state['master_dataset']
-                    current_vendor = master_df['vendor_number'].iloc[0]
-                
-                # Check if we have a vendor and historical data
-                vendor_has_data = False
-                if current_vendor:
-                    # Try to get historical data for this vendor
-                    if historical_snapshots:
-                        # Check if this vendor has any snapshots (ensure string comparison)
-                        # Note: get_historical_snapshots() returns lowercase 'vendor_number' key
-                        vendor_has_data = any(
-                            str(snap.get('vendor_number')) == str(current_vendor) 
-                            for snap in historical_snapshots
-                        )
-                    
-                    if not vendor_has_data:
-                        st.warning(f"⚠️ No historical forecast data found for vendor {current_vendor}")
-                        st.info("💡 **Tip:** Historical data becomes available after you save forecast uploads. Upload a forecast and save it to start building historical accuracy trends.")
+                # Check if we have historical data for selected vendors
+                if not all_historical_snapshots:
+                    st.warning(f"⚠️ No historical forecast data found for selected vendor(s): {', '.join(selected_vendors)}")
+                    st.info("💡 **Tip:** Historical data becomes available after you save forecast uploads. Upload a forecast and save it to start building historical accuracy trends.")
                 else:
-                    st.warning("⚠️ No vendor selected")
-                    
-                if historical_snapshots and len(historical_snapshots) > 0 and current_vendor and vendor_has_data:
                     if st.session_state.get('debug_mode', False):
-                        st.success(f"📈 **{len(historical_snapshots)} historical periods available for accuracy analysis**")
+                        st.success(f"📈 **{len(all_historical_snapshots)} historical periods available for accuracy analysis**")
                     
                     # Historical Accuracy Analysis with Filtering
                     st.markdown("#### 📈 Historical Accuracy Trends")
                     
                     # First, load all historical data to populate filter options
+                    # For multiple vendors, combine data from all selected vendors
                     with st.spinner("Loading historical data for filter options..."):
-                        # Get all historical accuracy data (12 months max for filter population)
-                        all_accuracy_data = get_historical_accuracy_data(current_vendor, 12)
+                        # Get all historical accuracy data for all selected vendors
+                        all_accuracy_data = []
+                        for vendor in selected_vendors:
+                            vendor_data = get_historical_accuracy_data(vendor, 12)
+                            if vendor_data:
+                                all_accuracy_data.extend(vendor_data)
                         
                         # Debug: Filter loading (hidden by default)
                         if st.session_state.get('debug_mode', False):
                             with st.expander("🔍 Debug - Filter Data Loading", expanded=False):
-                                st.write(f"Current vendor: {current_vendor}")
+                                st.write(f"Selected vendors: {selected_vendors}")
                                 st.write(f"Filter data loaded: {len(all_accuracy_data) if all_accuracy_data else 0} records")
                                 
                                 if all_accuracy_data:
@@ -15402,6 +15689,7 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                                     
                                     # Debug filter options
                                     st.write("**Filter Options Count:**")
+                                    st.write(f"  Unique Vendors: {all_hist_df['vendor_number'].nunique()}")
                                     st.write(f"  Unique SKUs: {all_hist_df['chewy_sku'].nunique()}")
                                     st.write(f"  Unique Brands: {all_hist_df['brand_name'].nunique()}")
                                     st.write(f"  Unique MC1: {all_hist_df['mc1_category'].nunique()}")
@@ -15605,8 +15893,12 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                         st.session_state['hist_initial_load'] = True
                         
                         with st.spinner("Loading historical accuracy data..."):
-                            # Get historical accuracy data with "Latest Wins" logic
-                            accuracy_data = get_historical_accuracy_data(current_vendor, lookback_periods)
+                            # Get historical accuracy data with "Latest Wins" logic for all selected vendors
+                            accuracy_data = []
+                            for vendor in selected_vendors:
+                                vendor_data = get_historical_accuracy_data(vendor, lookback_periods)
+                                if vendor_data:
+                                    accuracy_data.extend(vendor_data)
                             
                             if accuracy_data:
                                 # Convert to DataFrame for easier manipulation
@@ -16300,20 +16592,23 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                             
                             else:
                                 st.info("📊 No historical accuracy data available for the selected period")
-                    
-                else:
-                    st.info("📊 **No historical data available yet**")
-                    st.markdown("""
-                    **To enable historical accuracy analysis:**
-                    1. Save your current forecast reconciliation using the **💾 Save** button above
-                    2. Wait for the forecast period to complete (e.g., wait until December to analyze November accuracy)
-                    3. Upload your next month's forecast - the system will automatically calculate previous month's accuracy
-                    
-                    **Historical analysis will show:**
-                    - Which forecasts (Vendor vs Chewy) were more accurate
-                    - WAPE and Bias calculations over time
-                    - Accuracy trends by SKU, Brand, and Category
-                    """)
+                            
+                            # End of accuracy_data processing
+                        
+                        # If no accuracy data was found
+                        if not accuracy_data:
+                            st.info("📊 **No historical data available yet**")
+                            st.markdown("""
+**To enable historical accuracy analysis:**
+1. Save your current forecast reconciliation using the **💾 Save** button above
+2. Wait for the forecast period to complete (e.g., wait until December to analyze November accuracy)
+3. Upload your next month's forecast - the system will automatically calculate previous month's accuracy
+
+**Historical analysis will show:**
+- Which forecasts (Vendor vs Chewy) were more accurate
+- WAPE and Bias calculations over time
+- Accuracy trends by SKU, Brand, and Category
+""")
                     
             except Exception as e:
                 st.error(f"❌ **Error loading historical data:** {str(e)}")
@@ -16335,24 +16630,39 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                 st.warning("⚠️ **Forecast Evolution is not available in Historical Upload mode.**")
                 st.info("💡 **Tip:** Switch to **Current Analysis** or **View Historical** mode to access Forecast Evolution analysis.")
             else:
-                # Get current vendor
-                current_vendor = None
+                # Get current vendor(s)
+                current_vendors = []
                 if st.session_state.get('view_only_mode', False):
-                    current_vendor = st.session_state.get('view_only_vendor')
+                    # Check for both old single vendor and new multi-vendor keys
+                    if 'view_only_vendors' in st.session_state:
+                        current_vendors = st.session_state.get('view_only_vendors', [])
+                    elif 'view_only_vendor' in st.session_state:
+                        single_vendor = st.session_state.get('view_only_vendor')
+                        current_vendors = [single_vendor] if single_vendor else []
                 elif st.session_state.get('master_dataset_ready', False):
                     master_df = st.session_state['master_dataset']
-                    current_vendor = master_df['vendor_number'].iloc[0]
+                    current_vendors = master_df['vendor_number'].unique().tolist()
                 
-                if not current_vendor:
+                if not current_vendors:
                     st.info("ℹ️ Please select a vendor or upload a forecast to view evolution analysis.")
                 else:
+                    # For evolution analysis, allow user to select one vendor at a time
+                    if len(current_vendors) > 1:
+                        selected_vendor = st.selectbox(
+                            "Select vendor for evolution analysis:",
+                            options=current_vendors,
+                            help="Forecast Evolution shows how one vendor's forecasts have changed over time"
+                        )
+                    else:
+                        selected_vendor = current_vendors[0]
+                    
                     with st.spinner("Loading forecast evolution data..."):
                         try:
                             # Get all forecast uploads (not deduplicated)
-                            evolution_df = get_forecast_evolution_data(current_vendor)
+                            evolution_df = get_forecast_evolution_data(selected_vendor)
                             
                             if evolution_df.empty:
-                                st.warning(f"⚠️ No forecast uploads found for vendor {current_vendor}")
+                                st.warning(f"⚠️ No forecast uploads found for vendor {selected_vendor}")
                                 st.info("💡 **Tip:** Forecast Evolution becomes available after you save at least 2 forecast uploads.")
                             else:
                                 # Get unique uploads
@@ -16360,10 +16670,10 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                                 num_uploads = len(unique_uploads)
                                 
                                 if num_uploads < 2:
-                                    st.warning(f"⚠️ Only {num_uploads} upload found for vendor {current_vendor}")
+                                    st.warning(f"⚠️ Only {num_uploads} upload found for vendor {selected_vendor}")
                                     st.info("💡 **Tip:** Forecast Evolution requires at least 2 uploads to show how forecasts have changed over time.")
                                 else:
-                                    st.success(f"✅ Found {num_uploads} forecast uploads for vendor {current_vendor}")
+                                    st.success(f"✅ Found {num_uploads} forecast uploads for vendor {selected_vendor}")
                                     
                                     # Show upload selector
                                     st.markdown("#### 🎛️ Select Uploads to Compare")
@@ -16554,7 +16864,7 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                                             st.download_button(
                                                 label="📥 Download Full Forecast Evolution Data (CSV)",
                                                 data=csv_data,
-                                                file_name=f"forecast_evolution_vendor_{current_vendor}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                                file_name=f"forecast_evolution_vendor_{selected_vendor}_{datetime.now().strftime('%Y%m%d')}.csv",
                                                 mime="text/csv",
                                                 use_container_width=True,
                                                 help="Download all forecast data for detailed analysis in Excel or other tools"
@@ -16730,7 +17040,7 @@ The forecast provision date you entered ({user_snapshot_date.strftime('%m/%d/%Y'
                                     upload_timestamp,
                                     user_id,
                                     upload_notes
-                                FROM forecast_reconciliation_snapshots
+                                FROM EDLDB.SC_SANDBOX.FORECAST_RECONCILIATION_SNAPSHOTS
                                 WHERE snapshot_id = '{snapshot_id}'
                                 ORDER BY forecast_period_start, chewy_sku
                                 """
@@ -17696,7 +18006,7 @@ def main():
             "─── 🛠️ Tools ───",
             "Forecast Reconciliation",
             "PO Status",
-            "CPFR Deck Generator"
+            # "CPFR Deck Generator"  # Temporarily hidden - will be re-enabled after Apollo launch
         ]
         
         # Get default from session state or use SKU Audit
@@ -17718,7 +18028,7 @@ def main():
         st.session_state['navigation_selection'] = navigation_choice
         
         # Parse selection to determine what to show
-        tools_list = ["Forecast Reconciliation", "PO Status", "CPFR Deck Generator"]
+        tools_list = ["Forecast Reconciliation", "PO Status"]  # "CPFR Deck Generator" temporarily removed
         header_list = ["─── 📊 Analysis Sections ───", "─── 🛠️ Tools ───"]
         
         if navigation_choice in tools_list:
@@ -17852,7 +18162,6 @@ def main():
         **Available Tools:**
         - **📊 Forecast Reconciliation**: Upload and reconcile vendor forecasts against Chewy data
         - **📦 PO Status**: View purchase order status and delivery information
-        - **📊 CPFR Deck Generator**: Auto-generate PowerPoint presentations for vendor review meetings
         
         ---
         
